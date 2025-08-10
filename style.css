@@ -1,0 +1,163 @@
+/* Reset CSS */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: Arial, sans-serif;
+    background: #0d0d0d;
+    color: white;
+    line-height: 1.6;
+}
+
+/* Header */
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 15px 5%;
+    background: #111;
+}
+
+.logo {
+    color: #00ff99;
+    font-size: 1.5rem;
+}
+
+nav a {
+    color: white;
+    margin-left: 20px;
+    text-decoration: none;
+    transition: 0.3s;
+}
+
+nav a:hover {
+    color: #ff4ecb;
+}
+
+/* Hero Section */
+.hero {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 50px 5%;
+    flex-wrap: wrap;
+}
+
+.hero-text {
+    max-width: 500px;
+}
+
+.highlight {
+    color: #ff4ecb;
+}
+.highlight2 {
+    color: #00ff99;
+}
+
+.buttons {
+    margin-top: 20px;
+}
+
+.btn {
+    display: inline-block;
+    background: #00ff99;
+    padding: 10px 20px;
+    margin-right: 10px;
+    color: black;
+    font-weight: bold;
+    border-radius: 5px;
+    text-decoration: none;
+    transition: 0.3s;
+}
+
+.btn:hover {
+    background: #ff4ecb;
+    color: white;
+}
+
+.btn.secondary {
+    background: transparent;
+    border: 2px solid #ff4ecb;
+    color: #ff4ecb;
+}
+
+.hero-img img {
+    max-width: 300px;
+    border-radius: 50%;
+    border: 3px solid #00ff99;
+}
+
+/* Skills Section */
+#skills {
+    padding: 50px 5%;
+    text-align: center;
+}
+
+.skills-container {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    margin-top: 20px;
+}
+
+.skills-container span {
+    background: #222;
+    margin: 5px;
+    padding: 10px 15px;
+    border-radius: 20px;
+    border: 1px solid #00ff99;
+}
+
+/* Projects Section */
+#projects {
+    padding: 50px 5%;
+    text-align: center;
+}
+
+.projects-container {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+
+.project-card {
+    background: #111;
+    margin: 10px;
+    padding: 15px;
+    width: 250px;
+    border-radius: 10px;
+    text-align: left;
+}
+
+.project-card img {
+    width: 100%;
+    border-radius: 10px;
+}
+
+/* Contact Section */
+#contact {
+    padding: 50px 5%;
+    text-align: center;
+}
+
+/* Footer */
+footer {
+    text-align: center;
+    padding: 20px;
+    background: #111;
+    margin-top: 20px;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .hero {
+        flex-direction: column;
+        text-align: center;
+    }
+    .hero-img {
+        margin-top: 20px;
+    }
+}
