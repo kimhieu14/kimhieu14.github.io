@@ -1,0 +1,210 @@
+Ok, giờ mình hiểu rõ hơn rồi 👌.
+Bài toán của Kim Hiếu là:
+
+Công nhân không bấm nút trong giao diện, mà đạp nút vật lý → tín hiệu gửi vào PLC → từ đó WinForms app nhận tín hiệu (qua cổng COM/Serial hoặc qua OPC/Modbus tùy PLC).
+
+App chỉ cần xử lý tên ảnh theo mã QR, sau đó lưu thông tin vào file TXT để log/ghi lại.
+
+
+Mình sẽ viết như một chuyên gia triển khai WinForms app trong môi trường công nghiệp cho Hiếu nhé 🚀.
+
+
+---
+
+🔹 1. Chuẩn bị môi trường
+
+1. Phần cứng:
+
+Máy tính Windows cài Visual Studio 2022+.
+
+PLC (Siemens, Mitsubishi, Omron…) đã cấu hình để gửi tín hiệu qua Serial (RS232/RS485 → USB) hoặc Ethernet/OPC.
+
+Camera công nghiệp hoặc module chụp ảnh (có API/SDK riêng).
+
+
+
+2. Thư viện phần mềm cần cài (NuGet):
+
+System.IO.Ports (có sẵn trong .NET) → giao tiếp Serial với PLC.
+
+ZXing.Net → đọc QR code từ ảnh.
+
+System.Drawing.Common → xử lý ảnh.
+
+Không bắt buộc nhưng nên có: Serilog để log lỗi.
+
+
+
+
+
+---
+
+🔹 2. Luồng xử lý
+
+1. Công nhân đạp nút → PLC gửi tín hiệu (ví dụ gửi ký tự "TRIGGER") qua Serial.
+
+
+2. App WinForms lắng nghe cổng COM.
+
+
+3. Khi có tín hiệu:
+
+Kích hoạt chụp ảnh từ camera (gọi API SDK của camera).
+
+Đọc mã QR trong ảnh.
+
+Đặt tên file ảnh = mã QR (vd: QR12345.jpg).
+
+Lưu ảnh vào thư mục đã cấu hình.
+
+Ghi log thông tin ra log.txt (vd: 2025-09-09 10:15:20 | QR12345 | saved to D:\Images\QR12345.jpg).
+
+
+
+
+
+---
+
+🔹 3. Code mẫu WinForms App (.NET 8)
+
+Giả sử mình đơn giản hóa việc “chụp ảnh” = load sẵn ảnh từ thư mục test (để Hiếu dễ thử), sau này thay bằng SDK của camera.
+
+📂 Form1.cs
+
+using System;
+using System.IO;
+using System.IO.Ports;
+using System.Windows.Forms;
+using ZXing;
+
+namespace PLC_QR_Capture
+{
+    public partial class Form1 : Form
+    {
+        private SerialPort _serialPort;
+
+        public Form1()
+        {
+            InitializeComponent();
+            InitSerialPort();
+        }
+
+        private void InitSerialPort()
+        {
+            _serialPort = new SerialPort("COM3", 9600); // COM3 thay bằng cổng PLC
+            _serialPort.DataReceived += SerialDataReceived;
+            _serialPort.Open();
+        }
+
+        private void SerialDataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                string data = _serialPort.ReadLine().Trim();
+                if (data == "TRIGGER")
+                {
+                    this.Invoke(new Action(() =>
+                    {
+                        HandleCapture();
+                    }));
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"[ERROR] {ex.Message}");
+            }
+        }
+
+        private void HandleCapture()
+        {
+            try
+            {
+                // 🔹 Giả lập chụp ảnh: load ảnh test
+                string testImagePath = @"D:\Images\TestQR.png";
+                var bitmap = new System.Drawing.Bitmap(testImagePath);
+
+                // 🔹 Đọc QR code
+                var reader = new BarcodeReader();
+                var result = reader.Decode(bitmap);
+
+                if (result != null)
+                {
+                    string qrCode = result.Text;
+                    string saveDir = @"D:\Images\Captured";
+                    Directory.CreateDirectory(saveDir);
+
+                    string fileName = $"{qrCode}_{DateTime.Now:yyyyMMdd_HHmmss}.jpg";
+                    string savePath = Path.Combine(saveDir, fileName);
+
+                    bitmap.Save(savePath);
+
+                    LogToFile($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {qrCode} | Saved: {savePath}");
+                }
+                else
+                {
+                    LogToFile($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] QR not found.");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogToFile($"[ERROR] {ex.Message}");
+            }
+        }
+
+        private void LogToFile(string message)
+        {
+            string logPath = @"D:\Images\log.txt";
+            File.AppendAllText(logPath, message + Environment.NewLine);
+        }
+    }
+}
+
+
+---
+
+🔹 4. Ghi chú triển khai thực tế
+
+Serial COM:
+
+Vào Device Manager xem cổng COM thật sự (ví dụ COM3, COM5).
+
+Đảm bảo baudrate (9600/19200/115200) trùng với PLC.
+
+
+Camera SDK:
+
+Các hãng camera (Basler, Hikvision, IDS…) đều có SDK .NET (C# API).
+
+Thay phần testImagePath bằng lệnh camera.CaptureImage() từ SDK.
+
+
+File TXT log:
+
+Mỗi lần chụp sẽ thêm 1 dòng.
+
+Nếu cần đọc file lại thì chỉ cần File.ReadAllLines("log.txt").
+
+
+Error Handling:
+
+Nếu QR không đọc được → log thông báo "QR not found".
+
+Nếu PLC gửi sai tín hiệu → bỏ qua.
+
+
+
+
+---
+
+👉 Vậy để mình tùy chỉnh code cho chuẩn hơn, Kim Hiếu cho mình biết:
+
+PLC bên Hiếu định giao tiếp bằng Serial COM hay Ethernet/Modbus/OPC?
+
+Camera dùng loại gì (có SDK C# không, hay chỉ cần test demo bằng ảnh)?
+
+
+Nếu Hiếu xác nhận, mình sẽ viết bản full code hoàn chỉnh có cả giao diện WinForms (Form + Button + TextBox log) để chạy luôn.
+
+jajajajsjekkskdkdkd
+
+
