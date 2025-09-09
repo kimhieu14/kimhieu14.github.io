@@ -1,1 +1,688 @@
-add new
+Ok Kim Hiếu, dưới đây là một mẫu WinForms C# “production-ready skeleton” đã xử lý đầy đủ: kết nối tay scan Cino A680 qua cổng COM, kiểm tra/validate QR (prefix + version), chống trùng lặp, chụp 3 ảnh (trên/trái/phải) bằng webcam (OpenCV), lưu đúng cấu trúc thư mục, tính tổng số mã đã quét trong ngày, kết nối PLC Inovance H3U qua Modbus TCP (có sẵn chỗ đổi sang RTU nếu nhà máy dùng RS-485), gửi tín hiệu OK/NG, có log kèm timestamp, nút mở thư mục ảnh, và đầy đủ try/catch + thông báo lỗi rõ ràng.
+
+
+---
+
+1) Chuẩn bị NuGet
+
+Trong Project > Manage NuGet Packages cài:
+
+NModbus4 (Modbus TCP/RTU cho PLC)
+
+OpenCvSharp4 và OpenCvSharp4.runtime.win (chụp ảnh webcam)
+
+
+> Nếu bạn dùng camera công nghiệp SDK riêng (Basler/HIK/…): thay phần OpenCV bằng SDK tương ứng, nhưng giữ nguyên interface ICameraService.
+
+
+
+
+---
+
+2) Cấu trúc lưu ảnh
+
+imgAOI/
+  MatTren/
+    2025-09-09/
+       <QR>.png
+  MatTrai/
+    2025-09-09/
+       <QR>.png
+  MatPhai/
+    2025-09-09/
+       <QR>.png
+
+> Tổng số trong ngày = số file (hoặc số QR unique) trong MatTren/<yyyy-MM-dd> hôm nay.
+
+
+
+
+---
+
+3) UI theo yêu cầu
+
+Label “S/N” + TextBox hiển thị QR vừa quét (copy được).
+
+Label “Total” + TextBox readonly tổng trong ngày.
+
+Nút: Connect Scan, Disconnect Scan (Serial).
+
+Nút: Connect PLC, Disconnect PLC (Modbus).
+
+Nút: Capture 3 Images.
+
+Nút: Image Folder (mở imgAOI).
+
+Label/ô trạng thái PLC, trạng thái COM.
+
+Log dạng danh sách (timestamp) + nút Clear.
+
+
+> Mình tạo UI bằng code trong InitializeComponent() để copy-paste chạy được ngay (khỏi cần mở Designer).
+
+
+
+
+---
+
+4) Logic kiểm tra QR
+
+Hợp lệ nếu:
+
+Bắt buộc bắt đầu bằng 2025IT
+
+Có hậu tố version dạng +dd+dd (hai cặp số), ví dụ: 2025IT12+07+14
+
+
+Nếu không hợp lệ ⇒ báo lỗi NG (gửi tín hiệu dừng cho PLC) + log.
+
+Nếu hợp lệ:
+
+Kiểm tra trùng (đã tồn tại file cùng QR trong folder ngày) ⇒ nếu trùng báo và không tăng tổng.
+
+Nếu chưa trùng ⇒ gửi “OK” cho PLC (ghi coil/holding register), mở quyền chụp.
+
+
+
+
+---
+
+5) Mã nguồn
+
+Tạo project WinForms .NET 6/7/8. Thêm hai file sau.
+
+Program.cs
+
+using System;
+using System.Windows.Forms;
+
+namespace WinFormsAoiInovance
+{
+    internal static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            ApplicationConfiguration.Initialize();
+            Application.Run(new MainForm());
+        }
+    }
+}
+
+MainForm.cs
+
+using System;
+using System.Drawing;
+using System.IO.Ports;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Windows.Forms;
+using OpenCvSharp;
+using OpenCvSharp.Extensions;
+using System.Net.Sockets;
+using NModbus;
+
+namespace WinFormsAoiInovance
+{
+    public partial class MainForm : Form
+    {
+        // ====== Cấu hình chung ======
+        private const string RequiredPrefix = "2025IT";
+        // version pattern: +dd+dd ở cuối chuỗi
+        private static readonly Regex VersionRegex = new Regex(@"\+\d{2}\+\d{2}$", RegexOptions.Compiled);
+        private const string RootImageFolder = "imgAOI";
+        private static readonly string[] FaceFolders = { "MatTren", "MatTrai", "MatPhai" };
+
+        // ====== PLC (Modbus TCP) ======
+        // Chỉnh lại IP/Port/địa chỉ ghi theo thực tế của H3U. 
+        // Gợi ý: dùng coil 0 = OK, coil 1 = NG (ví dụ)
+        private string PlcIp = "192.168.1.10";
+        private int PlcPort = 502;
+        private ushort CoilOkAddress = 0;    // coil cho tín hiệu "OK"
+        private ushort CoilNgAddress = 1;    // coil cho tín hiệu "NG/Dừng"
+        private TcpClient? _plcClient;
+        private IModbusMaster? _modbusMaster;
+
+        // ====== Serial Scanner ======
+        private SerialPort? _serial;
+
+        // ====== Camera (OpenCV) ======
+        private ICameraService _camera;
+
+        // ====== State ======
+        private string? _lastValidQr;
+        private bool _readyToCapture = false;
+
+        // ====== UI Controls ======
+        private TextBox txtSn;
+        private TextBox txtTotal;
+        private ComboBox cboCom;
+        private Button btnScanConnect, btnScanDisconnect;
+        private TextBox txtPlcIp, txtPlcPort;
+        private Button btnPlcConnect, btnPlcDisconnect;
+        private Button btnCapture, btnOpenFolder, btnClearLog;
+        private Label lblComStatus, lblPlcStatus;
+        private ListBox lstLog;
+
+        public MainForm()
+        {
+            InitializeComponent();
+            _camera = new OpenCvCameraService(); // có thể thay bằng SDK hãng camera
+            EnsureFoldersForToday();
+            RefreshTotalCount();
+            Log("App ready.");
+        }
+
+        // ====================== UI ======================
+        private void InitializeComponent()
+        {
+            this.Text = "AOI WinForms - Inovance H3U + Cino A680";
+            this.Size = new Size(980, 600);
+            this.Font = new Font("Segoe UI", 10f);
+
+            var lblSn = new Label { Text = "S/N:", AutoSize = true, Location = new Point(20, 20) };
+            txtSn = new TextBox { Location = new Point(70, 16), Width = 360, ReadOnly = true };
+
+            var lblTotal = new Label { Text = "Total:", AutoSize = true, Location = new Point(460, 20) };
+            txtTotal = new TextBox { Location = new Point(515, 16), Width = 80, ReadOnly = true, TextAlign = HorizontalAlignment.Right };
+
+            // Serial (Scan)
+            var grpScan = new GroupBox { Text = "Scanner (COM)", Location = new Point(20, 60), Size = new Size(450, 130) };
+            var lblCom = new Label { Text = "Port:", AutoSize = true, Location = new Point(15, 30) };
+            cboCom = new ComboBox { Location = new Point(70, 26), Width = 120, DropDownStyle = ComboBoxStyle.DropDownList };
+            cboCom.Items.AddRange(SerialPort.GetPortNames());
+            var btnRefreshCom = new Button { Text = "Refresh", Location = new Point(200, 25), Width = 80 };
+            btnRefreshCom.Click += (s, e) => { cboCom.Items.Clear(); cboCom.Items.AddRange(SerialPort.GetPortNames()); };
+
+            btnScanConnect = new Button { Text = "Connect Scan", Location = new Point(15, 65), Width = 130 };
+            btnScanDisconnect = new Button { Text = "Disconnect Scan", Location = new Point(155, 65), Width = 150 };
+
+            btnScanConnect.Click += BtnScanConnect_Click;
+            btnScanDisconnect.Click += BtnScanDisconnect_Click;
+
+            lblComStatus = new Label { Text = "COM: Disconnected", AutoSize = true, Location = new Point(15, 100), ForeColor = Color.DarkRed };
+
+            grpScan.Controls.AddRange(new Control[] { lblCom, cboCom, btnRefreshCom, btnScanConnect, btnScanDisconnect, lblComStatus });
+
+            // PLC
+            var grpPlc = new GroupBox { Text = "PLC (Modbus TCP)", Location = new Point(490, 60), Size = new Size(460, 130) };
+            var lblIp = new Label { Text = "IP:", AutoSize = true, Location = new Point(15, 30) };
+            txtPlcIp = new TextBox { Location = new Point(50, 26), Width = 140, Text = PlcIp };
+
+            var lblPort = new Label { Text = "Port:", AutoSize = true, Location = new Point(210, 30) };
+            txtPlcPort = new TextBox { Location = new Point(255, 26), Width = 70, Text = PlcPort.ToString() };
+
+            btnPlcConnect = new Button { Text = "Connect PLC", Location = new Point(15, 65), Width = 140 };
+            btnPlcDisconnect = new Button { Text = "Disconnect PLC", Location = new Point(165, 65), Width = 160 };
+
+            btnPlcConnect.Click += BtnPlcConnect_Click;
+            btnPlcDisconnect.Click += BtnPlcDisconnect_Click;
+
+            lblPlcStatus = new Label { Text = "PLC: Disconnected", AutoSize = true, Location = new Point(15, 100), ForeColor = Color.DarkRed };
+
+            grpPlc.Controls.AddRange(new Control[] { lblIp, txtPlcIp, lblPort, txtPlcPort, btnPlcConnect, btnPlcDisconnect, lblPlcStatus });
+
+            // Actions
+            btnCapture = new Button { Text = "Capture 3 Images", Location = new Point(20, 210), Width = 180, Height = 36 };
+            btnCapture.Click += BtnCapture_Click;
+
+            btnOpenFolder = new Button { Text = "Image Folder", Location = new Point(220, 210), Width = 150, Height = 36 };
+            btnOpenFolder.Click += (s, e) => OpenFolder(RootImageFolder);
+
+            btnClearLog = new Button { Text = "Clear Log", Location = new Point(390, 210), Width = 120, Height = 36 };
+            btnClearLog.Click += (s, e) => lstLog.Items.Clear();
+
+            // Log
+            lstLog = new ListBox { Location = new Point(20, 260), Size = new Size(930, 280) };
+
+            Controls.AddRange(new Control[] {
+                lblSn, txtSn, lblTotal, txtTotal,
+                grpScan, grpPlc, btnCapture, btnOpenFolder, btnClearLog,
+                lstLog
+            });
+        }
+
+        // ====================== Scanner (Serial) ======================
+        private void BtnScanConnect_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                if (cboCom.SelectedItem == null)
+                {
+                    MessageBox.Show("Chọn cổng COM cho tay scan trước.", "Warning", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                string portName = cboCom.SelectedItem.ToString()!;
+                _serial = new SerialPort(portName, 115200, Parity.None, 8, StopBits.One);
+                _serial.DataReceived += Serial_DataReceived; // barcode bắn về như text + CR/LF
+                _serial.Open();
+
+                lblComStatus.Text = $"COM: Connected ({portName})";
+                lblComStatus.ForeColor = Color.DarkGreen;
+                Log($"Scanner connected: {portName}");
+            }
+            catch (Exception ex)
+            {
+                lblComStatus.Text = "COM: Error";
+                lblComStatus.ForeColor = Color.DarkRed;
+                LogError("Scanner connect failed", ex);
+                MessageBox.Show($"Không kết nối được tay scan: {ex.Message}", "COM Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void BtnScanDisconnect_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                if (_serial != null)
+                {
+                    _serial.DataReceived -= Serial_DataReceived;
+                    if (_serial.IsOpen) _serial.Close();
+                    _serial.Dispose();
+                    _serial = null;
+                }
+                lblComStatus.Text = "COM: Disconnected";
+                lblComStatus.ForeColor = Color.DarkRed;
+                Log("Scanner disconnected.");
+            }
+            catch (Exception ex)
+            {
+                LogError("Scanner disconnect failed", ex);
+            }
+        }
+
+        private void Serial_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                var sp = (SerialPort)sender;
+                string raw = sp.ReadExisting();
+                // Hầu hết scan gun gửi từng dòng (kết thúc CR/LF). Gom buffer cho đủ dòng.
+                foreach (var line in raw
+                    .Replace("\r", "")
+                    .Split('\n')
+                    .Select(x => x.Trim())
+                    .Where(x => !string.IsNullOrWhiteSpace(x)))
+                {
+                    this.BeginInvoke(new Action(() => OnQrRead(line)));
+                }
+            }
+            catch (Exception ex)
+            {
+                this.BeginInvoke(new Action(() =>
+                {
+                    LogError("Error reading scanner data", ex);
+                }));
+            }
+        }
+
+        private void OnQrRead(string qr)
+        {
+            try
+            {
+                txtSn.Text = qr;
+
+                // Validate prefix
+                if (!qr.StartsWith(RequiredPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log($"QR NG (sai prefix): {qr}");
+                    SendNgToPlcSafe();
+                    MessageBox.Show($"Mã không hợp lệ (prefix phải bắt đầu '{RequiredPrefix}')", "QR NG", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    _readyToCapture = false;
+                    return;
+                }
+
+                // Validate version suffix
+                if (!VersionRegex.IsMatch(qr))
+                {
+                    Log($"QR NG (sai version): {qr}");
+                    SendNgToPlcSafe();
+                    MessageBox.Show("Mã không hợp lệ (version phải dạng '+dd+dd', ví dụ '+07+14')", "QR NG", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    _readyToCapture = false;
+                    return;
+                }
+
+                // Check duplicate for today (MatTren làm chuẩn để đếm)
+                var todayFolder = GetTodayFolder(Path.Combine(RootImageFolder, "MatTren"));
+                var targetFile = Path.Combine(todayFolder, $"{SanitizeFileName(qr)}.png");
+                if (File.Exists(targetFile))
+                {
+                    Log($"QR trùng lặp (đã tồn tại): {qr}");
+                    MessageBox.Show("Mã đã tồn tại hôm nay!", "Duplicate", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    _readyToCapture = true; // vẫn cho chụp lại nếu cần thay ảnh
+                    _lastValidQr = qr;
+                    SendOkToPlcSafe(); // tùy quy chuẩn, có thể KHÔNG gửi OK lại
+                    return;
+                }
+
+                // OK => gởi tín hiệu 3 (OK)
+                _lastValidQr = qr;
+                _readyToCapture = true;
+                SendOkToPlcSafe();
+                Log($"QR OK: {qr}. Đã gửi tín hiệu OK cho PLC.");
+
+            }
+            catch (Exception ex)
+            {
+                LogError("OnQrRead failed", ex);
+                SendNgToPlcSafe();
+                _readyToCapture = false;
+            }
+        }
+
+        // ====================== Capture 3 Images ======================
+        private void BtnCapture_Click(object? sender, EventArgs e)
+        {
+            if (!_readyToCapture || string.IsNullOrWhiteSpace(_lastValidQr))
+            {
+                MessageBox.Show("Chưa có QR OK hoặc QR không hợp lệ.", "Capture blocked", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                string qr = _lastValidQr!;
+                var date = DateTime.Now.ToString("yyyy-MM-dd");
+
+                // Mỗi mặt một folder ngày
+                string[] destDirs = FaceFolders
+                    .Select(face => EnsureDir(Path.Combine(RootImageFolder, face, date)))
+                    .ToArray();
+
+                // Mở camera (lười lag): mở/đóng trong 1 lần bấm, chụp 3 khung
+                _camera.Open(0); // 0 = default webcam; đổi index theo máy
+                try
+                {
+                    // Warm-up 3-5 frames cho exposure/AE ổn định
+                    _camera.Warmup(5);
+
+                    // Danh sách (mặt, path đích)
+                    var targets = new (string face, string path)[]
+                    {
+                        ("MatTren", Path.Combine(destDirs[0], $"{SanitizeFileName(qr)}.png")),
+                        ("MatTrai", Path.Combine(destDirs[1], $"{SanitizeFileName(qr)}.png")),
+                        ("MatPhai", Path.Combine(destDirs[2], $"{SanitizeFileName(qr)}.png")),
+                    };
+
+                    foreach (var (face, path) in targets)
+                    {
+                        using var frame = _camera.Capture();
+                        if (frame == null) throw new Exception($"Không chụp được ảnh cho {face}");
+                        Cv2.ImWrite(path, frame);
+                        Log($"Chụp ảnh thành công: {face} => {path}");
+                    }
+                }
+                finally
+                {
+                    _camera.Close();
+                }
+
+                // Cập nhật tổng
+                RefreshTotalCount();
+                MessageBox.Show("Chụp 3 ảnh thành công!", "Capture", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                LogError("Capture failed", ex);
+                MessageBox.Show($"Lỗi chụp ảnh: {ex.Message}", "Capture Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // ====================== PLC (Modbus TCP) ======================
+        private void BtnPlcConnect_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                PlcIp = txtPlcIp.Text.Trim();
+                if (!int.TryParse(txtPlcPort.Text, out PlcPort)) PlcPort = 502;
+
+                _plcClient = new TcpClient();
+                _plcClient.Connect(PlcIp, PlcPort);
+
+                var factory = new ModbusFactory();
+                _modbusMaster = factory.CreateMaster(_plcClient);
+                lblPlcStatus.Text = $"PLC: Connected ({PlcIp}:{PlcPort})";
+                lblPlcStatus.ForeColor = Color.DarkGreen;
+                Log($"PLC connected: {PlcIp}:{PlcPort}");
+            }
+            catch (Exception ex)
+            {
+                lblPlcStatus.Text = "PLC: Error";
+                lblPlcStatus.ForeColor = Color.DarkRed;
+                LogError("PLC connect failed", ex);
+                MessageBox.Show($"Không kết nối được PLC: {ex.Message}", "PLC Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void BtnPlcDisconnect_Click(object? sender, EventArgs e)
+        {
+            try
+            {
+                if (_plcClient != null)
+                {
+                    _plcClient.Close();
+                    _plcClient.Dispose();
+                    _plcClient = null;
+                }
+                _modbusMaster = null;
+                lblPlcStatus.Text = "PLC: Disconnected";
+                lblPlcStatus.ForeColor = Color.DarkRed;
+                Log("PLC disconnected.");
+            }
+            catch (Exception ex)
+            {
+                LogError("PLC disconnect failed", ex);
+            }
+        }
+
+        private void SendOkToPlcSafe()
+        {
+            try
+            {
+                if (_modbusMaster == null) { Log("PLC not connected - skip OK signal."); return; }
+                // Ví dụ: ghi coil địa chỉ CoilOkAddress = true, và (option) reset NG coil
+                _modbusMaster.WriteSingleCoil(1, CoilOkAddress, true);
+                _modbusMaster.WriteSingleCoil(1, CoilNgAddress, false);
+            }
+            catch (Exception ex)
+            {
+                LogError("SendOkToPlc failed", ex);
+            }
+        }
+
+        private void SendNgToPlcSafe()
+        {
+            try
+            {
+                if (_modbusMaster == null) { Log("PLC not connected - skip NG signal."); return; }
+                _modbusMaster.WriteSingleCoil(1, CoilNgAddress, true);
+                _modbusMaster.WriteSingleCoil(1, CoilOkAddress, false);
+            }
+            catch (Exception ex)
+            {
+                LogError("SendNgToPlc failed", ex);
+            }
+        }
+
+        // ====================== Helpers ======================
+        private void EnsureFoldersForToday()
+        {
+            foreach (var face in FaceFolders)
+            {
+                EnsureDir(Path.Combine(RootImageFolder, face, DateTime.Now.ToString("yyyy-MM-dd")));
+            }
+        }
+
+        private static string EnsureDir(string path)
+        {
+            Directory.CreateDirectory(path);
+            return path;
+        }
+
+        private static string GetTodayFolder(string baseFaceFolder)
+        {
+            string path = Path.Combine(baseFaceFolder, DateTime.Now.ToString("yyyy-MM-dd"));
+            Directory.CreateDirectory(path);
+            return path;
+        }
+
+        private static string SanitizeFileName(string name)
+        {
+            foreach (char c in Path.GetInvalidFileNameChars())
+                name = name.Replace(c, '_');
+            return name;
+        }
+
+        private void RefreshTotalCount()
+        {
+            try
+            {
+                var folder = GetTodayFolder(Path.Combine(RootImageFolder, "MatTren"));
+                if (!Directory.Exists(folder)) { txtTotal.Text = "0"; return; }
+
+                // Đếm unique QR (loại đuôi)
+                var total = Directory.GetFiles(folder, "*.png").Length;
+                txtTotal.Text = total.ToString();
+            }
+            catch (Exception ex)
+            {
+                LogError("RefreshTotalCount failed", ex);
+                txtTotal.Text = "0";
+            }
+        }
+
+        private void OpenFolder(string path)
+        {
+            try
+            {
+                if (!Directory.Exists(path)) Directory.CreateDirectory(path);
+                System.Diagnostics.Process.Start("explorer.exe", Path.GetFullPath(path));
+            }
+            catch (Exception ex)
+            {
+                LogError("OpenFolder failed", ex);
+            }
+        }
+
+        private void Log(string message)
+        {
+            lstLog.Items.Add($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}");
+            lstLog.TopIndex = lstLog.Items.Count - 1;
+        }
+
+        private void LogError(string title, Exception ex)
+        {
+            lstLog.Items.Add($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] ERROR: {title} - {ex.Message}");
+            lstLog.TopIndex = lstLog.Items.Count - 1;
+        }
+    }
+
+    // ====================== Camera Service Abstraction ======================
+    public interface ICameraService : IDisposable
+    {
+        void Open(int cameraIndex);
+        void Close();
+        void Warmup(int frames);
+        Mat Capture();
+    }
+
+    public class OpenCvCameraService : ICameraService
+    {
+        private VideoCapture? _cap;
+
+        public void Open(int cameraIndex)
+        {
+            _cap = new VideoCapture(cameraIndex);
+            if (!_cap.IsOpened()) throw new Exception("Không mở được camera.");
+            // Có thể set thêm _cap.FrameWidth/Height, Exposure...
+        }
+
+        public void Warmup(int frames)
+        {
+            if (_cap == null) return;
+            using var tmp = new Mat();
+            for (int i = 0; i < frames; i++) _cap.Read(tmp);
+        }
+
+        public Mat Capture()
+        {
+            if (_cap == null) throw new Exception("Camera chưa mở.");
+            var mat = new Mat();
+            if (!_cap.Read(mat) || mat.Empty()) throw new Exception("Không đọc được khung hình.");
+            return mat;
+        }
+
+        public void Close()
+        {
+            _cap?.Release();
+            _cap?.Dispose();
+            _cap = null;
+        }
+
+        public void Dispose() => Close();
+    }
+}
+
+
+---
+
+6) Ghi chú triển khai thực tế
+
+PLC Inovance H3U:
+
+Thường hỗ trợ Modbus TCP (qua module Ethernet) và Modbus RTU (RS-485). Ở code mẫu mình dùng Modbus TCP.
+
+Nếu nhà máy dùng RTU, thay phần TCP bằng SerialPort + NModbus RTU:
+
+var factory = new ModbusFactory();
+var serial = new SerialPort("COM5", 9600, Parity.None, 8, StopBits.One);
+serial.Open();
+var adapter = new NModbus.IO.SerialPortAdapter(serial);
+_modbusMaster = factory.CreateRtuMaster(adapter);
+_modbusMaster.WriteSingleCoil(slaveId: 1, CoilOkAddress, true);
+
+Địa chỉ coil/holding (OK/NG) phải khớp chương trình PLC (H3U). Nếu PLC cần “pulse” thay vì giữ mức, bạn có thể ghi true, chờ 100ms rồi ghi false.
+
+
+Scanner Cino A680:
+
+Nếu cấu hình ở chế độ USB-COM (CDC), code trên OK. Nếu ở chế độ USB-HID (keyboard emulation), bạn có thể bỏ COM, và lắng KeyPress trên form thay thế. Tuy vậy, chế độ COM ổn định hơn cho máy tự động.
+
+
+Chống trùng lặp:
+
+Đang check theo file ở thư mục MatTren ngày hôm nay. Nếu bạn muốn “unique toàn xưởng” (mọi ngày), thay logic bằng tìm trong toàn bộ imgAOI.
+
+
+Đổi tên file/định dạng:
+
+Mặc định .png. Có thể đổi sang .jpg/.bmp tuỳ yêu cầu.
+
+
+Hiệu năng:
+
+Với camera công nghiệp, nên mở camera sẵn khi ca làm bắt đầu để giảm độ trễ, và chỉ capture khung hình khi bấm. Ở đây mình mở/đóng cho đơn giản.
+
+
+Bảo trì:
+
+Tách cấu hình (IP PLC, cổng COM mặc định, địa chỉ coil, index camera, đường dẫn lưu) vào một file appsettings.json là tốt hơn.
+
+
+
+
+---
+
+Nếu Kim Hiếu muốn, mình có thể:
+
+Xuất bản build (.exe) + appsettings.json.
+
+Chuyển PLC sang Modbus RTU.
+
+Thay OpenCV bằng SDK camera hãng.
+
+Bổ sung hiển thị preview webcam trên Form.
+
+
