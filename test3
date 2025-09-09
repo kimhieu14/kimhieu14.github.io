@@ -1,0 +1,724 @@
+Tốt — dưới đây mình viết sẵn một ứng dụng WinForms (.NET Framework / .NET 6/7 WinForms đều có thể chạy với vài chỉnh sửa nhỏ) như một chuyên gia, đầy đủ, có xử lý lỗi (try/catch), quản lý kết nối PLC (Modbus TCP), cổng COM cho tay scan Cino A680, logic kiểm tra mã QR (prefix 2025IT + version +xx+yy), kiểm tra trùng, tạo cấu trúc folder imgAOI\MatTren|MatTrai|MatPhai\<yyyyMMdd>\, di chuyển/đổi tên ảnh khi có lệnh chụp từ PLC, và ghi log / txt. Mình cũng kèm hướng dẫn cài thư viện NuGet cần thiết và các chỗ bạn cần chỉnh (PLC register, temp folder nơi camera lưu ảnh). Mọi phần đều có comment giải thích.
+
+> LƯU Ý TRƯỚC KHI CHẠY:
+
+Bạn cần cài package Modbus (ví dụ EasyModbusTCP.NET hoặc NModbus4). Trong code bên dưới mình dùng EasyModbus (nuget EasyModbusTCP.NET). Nếu bạn muốn dùng NModbus, mình có thể chỉnh lại.
+
+Cấu hình PLC (IP, Port, địa chỉ holding register để gửi tín hiệu OK/NG, địa chỉ trigger chụp) và COM port scanner (baudrate, parity) có thể khác — mình để biến cấu hình ở đầu code để chỉnh nhanh.
+
+Ứng dụng giả định hệ thống chụp ảnh (camera/PLC) đổ 3 ảnh tạm vào một folder tạm (tempCaptureFolder). Ứng dụng sẽ tìm 3 file mới nhất ở đó và di chuyển -> tên theo QR. Nếu hệ thống camera khác (ví dụ push ảnh lên app), bạn cần thay phần lấy file.
+
+
+
+
+
+---
+
+1) Hướng dẫn nhanh trước khi vào code
+
+1. Mở Visual Studio, tạo WinForms App (C#).
+
+
+2. Cài NuGet: Install-Package EasyModbusTCP.NET
+
+
+3. Thêm file Program.cs (mặc định), thay Form1.cs bằng mã bên dưới (mình tạo UI programmatically, không cần Designer).
+
+
+4. Chỉnh các tham số ở Config (PLC IP/port, register addresses, temp folder path, root img folder, COM port).
+
+
+5. Build & chạy.
+
+
+
+
+---
+
+2) Mã C# đầy đủ (Form + logic)
+
+// File: Form1.cs
+using System;
+using System.Drawing;
+using System.IO;
+using System.IO.Ports;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using EasyModbus; // NuGet EasyModbusTCP.NET
+
+namespace AoiWinformApp
+{
+    public class Config
+    {
+        // PLC config - chỉnh theo PLC thực tế của bạn
+        public static string PlcIp = "192.168.0.10";
+        public static int PlcPort = 502;
+
+        // We use holding register writes.
+        // Gửi giá trị 3 cho OK -> Holding register address (index)
+        public static int PlcRegisterWriteAddress = 1; // điều chỉnh theo PLC
+        public static int PlcValueOk = 3;
+        public static int PlcValueNg = 0;
+
+        // Poller register: PLC sẽ đặt 1 tại register này khi chụp xong (foot pedal -> plc -> hệ thống chụp -> plc set flag)
+        public static int PlcCaptureFlagRegister = 2; // register index PLC sẽ set =1 khi 3 ảnh đã sẵn sàng
+
+        // Thời gian poll PLC (ms)
+        public static int PlcPollIntervalMs = 500;
+
+        // Scanner COM config - chỉnh COM, baud nếu cần
+        public static string ScannerComPort = "COM3";
+        public static int ScannerBaudRate = 115200;
+        public static Parity ScannerParity = Parity.None;
+        public static int ScannerDataBits = 8;
+        public static StopBits ScannerStopBits = StopBits.One;
+
+        // Thư mục ảnh gốc (camera hoặc PLC drop ảnh ở đây)
+        public static string TempCaptureFolder = @"C:\AOI_Temp"; // nơi hệ thống chụp ảnh ghi tạm
+
+        // Root image folder
+        public static string ImgRoot = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "imgAOI");
+
+        // Subfolders
+        public static string FoldTop = "MatTren";
+        public static string FoldLeft = "MatTrai";
+        public static string FoldRight = "MatPhai";
+
+        // Log file to append scanned codes
+        public static string ScannedTxtFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "scanned_codes.txt");
+
+        // Regex to validate QR:
+        // Example "2025IT12+07+14"
+        // Starts with 2025IT, then some chars/numbers, then +NN+NN where NN are digits (version).
+        public static string QrRegexPattern = @"^2025IT[\w-]*\+\d{2}\+\d{2}$";
+    }
+
+    public class Form1 : Form
+    {
+        // UI controls
+        private TextBox txtSN;
+        private TextBox txtTotal;
+        private Button btnConnectScan, btnDisconnectScan, btnConnectPlc, btnDisconnectPlc, btnOpenFolder, btnClear;
+        private Label lblPlcStatus, lblComStatus;
+        private ListBox lstLog;
+
+        // Serial & PLC
+        private SerialPort scannerPort;
+        private ModbusClient modbusClient;
+        private System.Threading.Timer plcPollTimer;
+
+        // State
+        private string lastScannedCode = "";
+        private int totalToday = 0;
+        private string currentDateFolder = DateTime.Now.ToString("yyyyMMdd");
+        private readonly object locker = new object();
+
+        public Form1()
+        {
+            InitializeUI();
+            EnsureFoldersExist();
+            LoadTodayCount();
+        }
+
+        private void InitializeUI()
+        {
+            Text = "AOI Manager - PLC + Scanner";
+            Width = 900;
+            Height = 600;
+            StartPosition = FormStartPosition.CenterScreen;
+
+            var lbl1 = new Label { Text = "S/N", Location = new Point(20, 20), AutoSize = true };
+            Controls.Add(lbl1);
+            txtSN = new TextBox { Location = new Point(70, 16), Width = 420, ReadOnly = true };
+            Controls.Add(txtSN);
+
+            var lblTotal = new Label { Text = "Total", Location = new Point(510, 20), AutoSize = true };
+            Controls.Add(lblTotal);
+            txtTotal = new TextBox { Location = new Point(560, 16), Width = 80, ReadOnly = true };
+            Controls.Add(txtTotal);
+
+            btnConnectScan = new Button { Text = "Connect Scan", Location = new Point(20, 60), Width = 120 };
+            btnDisconnectScan = new Button { Text = "Disconnect Scan", Location = new Point(150, 60), Width = 120 };
+            btnConnectPlc = new Button { Text = "Connect PLC", Location = new Point(290, 60), Width = 120 };
+            btnDisconnectPlc = new Button { Text = "Disconnect PLC", Location = new Point(420, 60), Width = 120 };
+            btnOpenFolder = new Button { Text = "Image Folder", Location = new Point(560, 60), Width = 120 };
+            btnClear = new Button { Text = "Clear Log", Location = new Point(690, 60), Width = 120 };
+
+            Controls.AddRange(new Control[] { btnConnectScan, btnDisconnectScan, btnConnectPlc, btnDisconnectPlc, btnOpenFolder, btnClear });
+
+            lblPlcStatus = new Label { Text = "PLC: Disconnected", Location = new Point(20, 100), AutoSize = true, ForeColor = Color.Red };
+            lblComStatus = new Label { Text = "COM: Disconnected", Location = new Point(300, 100), AutoSize = true, ForeColor = Color.Red };
+            Controls.Add(lblPlcStatus);
+            Controls.Add(lblComStatus);
+
+            lstLog = new ListBox { Location = new Point(20, 140), Width = 820, Height = 380 };
+            Controls.Add(lstLog);
+
+            // events
+            btnConnectScan.Click += BtnConnectScan_Click;
+            btnDisconnectScan.Click += BtnDisconnectScan_Click;
+            btnConnectPlc.Click += BtnConnectPlc_Click;
+            btnDisconnectPlc.Click += BtnDisconnectPlc_Click;
+            btnOpenFolder.Click += BtnOpenFolder_Click;
+            btnClear.Click += BtnClear_Click;
+
+            // initial values
+            txtTotal.Text = totalToday.ToString();
+        }
+
+        private void EnsureFoldersExist()
+        {
+            try
+            {
+                Directory.CreateDirectory(Config.ImgRoot);
+                Directory.CreateDirectory(Path.Combine(Config.ImgRoot, Config.FoldTop));
+                Directory.CreateDirectory(Path.Combine(Config.ImgRoot, Config.FoldLeft));
+                Directory.CreateDirectory(Path.Combine(Config.ImgRoot, Config.FoldRight));
+            }
+            catch (Exception ex)
+            {
+                Log($"Error khi tạo folder imgAOI: {ex.Message}");
+            }
+        }
+
+        private void LoadTodayCount()
+        {
+            try
+            {
+                string todayFolder = Path.Combine(Config.ImgRoot, Config.FoldTop, DateTime.Now.ToString("yyyyMMdd"));
+                if (Directory.Exists(todayFolder))
+                {
+                    // count files across the 3 subfolders by distinct SN filenames (without suffix)
+                    var top = Directory.GetFiles(Path.Combine(Config.ImgRoot, Config.FoldTop, DateTime.Now.ToString("yyyyMMdd")), "*", SearchOption.TopDirectoryOnly);
+                    // We assume per SN we name images with same base name -> count unique base names:
+                    var baseNames = top.Select(f => Path.GetFileNameWithoutExtension(f)).Select(n => n.Split('_')[0]).Distinct().ToList();
+                    totalToday = baseNames.Count;
+                }
+                else totalToday = 0;
+            }
+            catch { totalToday = 0; }
+            txtTotal.Text = totalToday.ToString();
+        }
+
+        #region BUTTON EVENTS
+        private void BtnConnectScan_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (scannerPort != null && scannerPort.IsOpen)
+                {
+                    Log("Scanner already connected.");
+                    return;
+                }
+
+                scannerPort = new SerialPort(Config.ScannerComPort, Config.ScannerBaudRate, Config.ScannerParity, Config.ScannerDataBits, Config.ScannerStopBits);
+                scannerPort.DataReceived += ScannerPort_DataReceived;
+                scannerPort.Open();
+                lblComStatus.Text = $"COM: Connected ({Config.ScannerComPort})";
+                lblComStatus.ForeColor = Color.Green;
+                Log($"Connected to scanner on {Config.ScannerComPort}");
+            }
+            catch (Exception ex)
+            {
+                Log($"Lỗi kết nối scanner: {ex.Message}");
+                lblComStatus.Text = "COM: Error";
+                lblComStatus.ForeColor = Color.Red;
+            }
+        }
+
+        private void BtnDisconnectScan_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (scannerPort != null)
+                {
+                    scannerPort.DataReceived -= ScannerPort_DataReceived;
+                    if (scannerPort.IsOpen) scannerPort.Close();
+                    scannerPort.Dispose();
+                    scannerPort = null;
+                }
+                lblComStatus.Text = "COM: Disconnected";
+                lblComStatus.ForeColor = Color.Red;
+                Log("Disconnected scanner.");
+            }
+            catch (Exception ex)
+            {
+                Log($"Lỗi ngắt scanner: {ex.Message}");
+            }
+        }
+
+        private void BtnConnectPlc_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (modbusClient != null && modbusClient.Connected)
+                {
+                    Log("PLC already connected.");
+                    return;
+                }
+
+                modbusClient = new ModbusClient(Config.PlcIp, Config.PlcPort);
+                modbusClient.Connect();
+                lblPlcStatus.Text = $"PLC: Connected ({Config.PlcIp})";
+                lblPlcStatus.ForeColor = Color.Green;
+                Log($"Connected to PLC {Config.PlcIp}:{Config.PlcPort}");
+
+                // start poll timer
+                plcPollTimer = new System.Threading.Timer(PlcPollCallback, null, 0, Config.PlcPollIntervalMs);
+            }
+            catch (Exception ex)
+            {
+                Log($"Lỗi kết nối PLC: {ex.Message}");
+                lblPlcStatus.Text = "PLC: Error";
+                lblPlcStatus.ForeColor = Color.Red;
+            }
+        }
+
+        private void BtnDisconnectPlc_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (plcPollTimer != null)
+                {
+                    plcPollTimer.Dispose();
+                    plcPollTimer = null;
+                }
+
+                if (modbusClient != null)
+                {
+                    if (modbusClient.Connected) modbusClient.Disconnect();
+                    modbusClient = null;
+                }
+
+                lblPlcStatus.Text = "PLC: Disconnected";
+                lblPlcStatus.ForeColor = Color.Red;
+                Log("Disconnected PLC.");
+            }
+            catch (Exception ex)
+            {
+                Log($"Lỗi ngắt PLC: {ex.Message}");
+            }
+        }
+
+        private void BtnOpenFolder_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                System.Diagnostics.Process.Start("explorer.exe", Config.ImgRoot);
+            }
+            catch (Exception ex)
+            {
+                Log($"Không mở được folder: {ex.Message}");
+            }
+        }
+
+        private void BtnClear_Click(object sender, EventArgs e)
+        {
+            lstLog.Items.Clear();
+        }
+        #endregion
+
+        #region SCANNER
+        private void ScannerPort_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                // Read existing line(s)
+                string data = scannerPort.ReadExisting();
+                if (string.IsNullOrWhiteSpace(data)) return;
+
+                // The scanner may send newline char; clean it.
+                string scanned = data.Replace("\r", "").Replace("\n", "").Trim();
+                if (string.IsNullOrEmpty(scanned)) return;
+
+                // Some scanners may send additional characters; handle multiple codes in buffer:
+                var parts = scanned.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var part in parts)
+                {
+                    ProcessScannedCode(part.Trim());
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Lỗi đọc scanner: {ex.Message}");
+            }
+        }
+
+        private void ProcessScannedCode(string code)
+        {
+            // This runs in worker thread (SerialPort thread) so marshal UI updates
+            this.BeginInvoke(new Action(() =>
+            {
+                try
+                {
+                    Log($"Scanned: {code}");
+                    txtSN.Text = code;
+                    lastScannedCode = code;
+
+                    // Validate
+                    if (!Regex.IsMatch(code, Config.QrRegexPattern))
+                    {
+                        Log($"QR lỗi - không đúng định dạng hoặc prefix/version: {code}");
+                        SendPlcNg(); // send NG signal to PLC
+                        return;
+                    }
+
+                    // Extract base serial name for filename (we will use full code as filename safe)
+                    string safeFileName = MakeSafeFilename(code);
+
+                    // Check if already exists in today's subfolders (check MatTren as canonical)
+                    string today = DateTime.Now.ToString("yyyyMMdd");
+                    string targetTop = Path.Combine(Config.ImgRoot, Config.FoldTop, today, $"{safeFileName}.jpg");
+                    if (File.Exists(targetTop))
+                    {
+                        Log($"Serial đã tồn tại trong ngày: {code}");
+                        // Do not increment total; but still tell PLC NG? We'll consider NG because duplicate
+                        SendPlcNg();
+                        return;
+                    }
+
+                    // If OK: mark PLC with OK value
+                    SendPlcOk();
+
+                    // Write to scanned txt file with timestamp
+                    AppendScannedToTxt(code);
+
+                    // increment total (but only after actual images are saved - to be safe we increment when images moved)
+                    // We will wait for PLC capture trigger to actually move images and then increment count.
+                }
+                catch (Exception ex)
+                {
+                    Log($"Lỗi xử lý mã đã quét: {ex.Message}");
+                }
+            }));
+        }
+
+        private string MakeSafeFilename(string name)
+        {
+            foreach (char c in Path.GetInvalidFileNameChars())
+                name = name.Replace(c, '_');
+            return name;
+        }
+
+        private void AppendScannedToTxt(string code)
+        {
+            try
+            {
+                var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}\t{code}";
+                File.AppendAllLines(Config.ScannedTxtFile, new[] { line });
+            }
+            catch (Exception ex)
+            {
+                Log($"Lỗi ghi txt: {ex.Message}");
+            }
+        }
+        #endregion
+
+        #region PLC
+        private void PlcPollCallback(object state)
+        {
+            try
+            {
+                if (modbusClient == null || !modbusClient.Connected) return;
+
+                // Read a single holding register at PlcCaptureFlagRegister
+                int registerIndex = Config.PlcCaptureFlagRegister;
+                int[] regs = modbusClient.ReadHoldingRegisters(registerIndex, 1);
+                if (regs != null && regs.Length > 0)
+                {
+                    int val = regs[0];
+                    if (val == 1)
+                    {
+                        // Reset flag on PLC (set to 0) - optional but commonly necessary
+                        try
+                        {
+                            modbusClient.WriteMultipleRegisters(registerIndex, new int[] { 0 });
+                        }
+                        catch (Exception ex)
+                        {
+                            Log($"Không reset được flag capture trên PLC: {ex.Message}");
+                        }
+
+                        // Perform capture handling
+                        Log("PLC báo: ảnh đã chụp (flag=1). Bắt đầu xử lý 3 ảnh...");
+                        HandleCaptureEvent();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // If PLC disconnects, update status on UI
+                this.BeginInvoke(new Action(() =>
+                {
+                    lblPlcStatus.Text = $"PLC: Error {ex.Message}";
+                    lblPlcStatus.ForeColor = Color.Red;
+                }));
+                Log($"Lỗi khi poll PLC: {ex.Message}");
+            }
+        }
+
+        private void SendPlcOk()
+        {
+            try
+            {
+                if (modbusClient == null || !modbusClient.Connected)
+                {
+                    Log("Không thể gửi PLC OK: PLC chưa kết nối.");
+                    return;
+                }
+
+                modbusClient.WriteSingleRegister(Config.PlcRegisterWriteAddress, Config.PlcValueOk);
+                Log($"Gửi PLC: OK (reg {Config.PlcRegisterWriteAddress} = {Config.PlcValueOk})");
+            }
+            catch (Exception ex)
+            {
+                Log($"Lỗi gửi PLC OK: {ex.Message}");
+            }
+        }
+
+        private void SendPlcNg()
+        {
+            try
+            {
+                if (modbusClient == null || !modbusClient.Connected)
+                {
+                    Log("Không thể gửi PLC NG: PLC chưa kết nối.");
+                    return;
+                }
+
+                modbusClient.WriteSingleRegister(Config.PlcRegisterWriteAddress, Config.PlcValueNg);
+                Log($"Gửi PLC: NG (reg {Config.PlcRegisterWriteAddress} = {Config.PlcValueNg})");
+            }
+            catch (Exception ex)
+            {
+                Log($"Lỗi gửi PLC NG: {ex.Message}");
+            }
+        }
+        #endregion
+
+        #region CAPTURE HANDLING (move images)
+        private void HandleCaptureEvent()
+        {
+            // We assume lastScannedCode contains the SN for which images are for.
+            // If lastScannedCode empty -> log error.
+            if (string.IsNullOrWhiteSpace(lastScannedCode))
+            {
+                Log("Có tín hiệu chụp nhưng chưa có mã QR hợp lệ gần nhất. Bỏ qua.");
+                return;
+            }
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    var safeFileName = MakeSafeFilename(lastScannedCode);
+                    string today = DateTime.Now.ToString("yyyyMMdd");
+
+                    // ensure today's folders exist
+                    string topFolder = Path.Combine(Config.ImgRoot, Config.FoldTop, today);
+                    string leftFolder = Path.Combine(Config.ImgRoot, Config.FoldLeft, today);
+                    string rightFolder = Path.Combine(Config.ImgRoot, Config.FoldRight, today);
+                    Directory.CreateDirectory(topFolder);
+                    Directory.CreateDirectory(leftFolder);
+                    Directory.CreateDirectory(rightFolder);
+
+                    // Find 3 latest files in TempCaptureFolder
+                    if (!Directory.Exists(Config.TempCaptureFolder))
+                    {
+                        Log($"Temp capture folder không tồn tại: {Config.TempCaptureFolder}");
+                        return;
+                    }
+
+                    var files = new DirectoryInfo(Config.TempCaptureFolder)
+                        .GetFiles()
+                        .OrderByDescending(f => f.CreationTimeUtc)
+                        .ToArray();
+
+                    if (files.Length < 3)
+                    {
+                        Log($"Không tìm đủ 3 ảnh trong folder tạm (tìm thấy {files.Length}).");
+                        return;
+                    }
+
+                    // Pick the 3 newest
+                    var selected = files.Take(3).ToArray();
+
+                    // Map them to top/left/right by order (best-effort).
+                    // IMPORTANT: nếu camera có naming convention, bạn nên map theo tên; ở đây ta dùng thứ tự newest->oldest
+                    string targetTop = Path.Combine(topFolder, $"{safeFileName}.jpg");
+                    string targetLeft = Path.Combine(leftFolder, $"{safeFileName}.jpg");
+                    string targetRight = Path.Combine(rightFolder, $"{safeFileName}.jpg");
+
+                    // If any exists already -> treat as duplicate/error
+                    if (File.Exists(targetTop) || File.Exists(targetLeft) || File.Exists(targetRight))
+                    {
+                        Log($"Ảnh cho mã {lastScannedCode} đã tồn tại - bỏ qua ghi ảnh.");
+                        return;
+                    }
+
+                    // Move/rename: selected[0] -> top, [1]->left, [2]->right
+                    TryMoveFile(selected[0].FullName, targetTop);
+                    TryMoveFile(selected[1].FullName, targetLeft);
+                    TryMoveFile(selected[2].FullName, targetRight);
+
+                    // increment total and update UI
+                    lock (locker)
+                    {
+                        totalToday++;
+                        this.BeginInvoke(new Action(() => txtTotal.Text = totalToday.ToString()));
+                    }
+
+                    Log($"Đã lưu 3 ảnh cho {lastScannedCode} vào folder ngày {today}.");
+
+                }
+                catch (Exception ex)
+                {
+                    Log($"Lỗi xử lý ảnh: {ex.Message}");
+                }
+            });
+        }
+
+        private void TryMoveFile(string source, string dest)
+        {
+            try
+            {
+                File.Move(source, dest);
+                Log($"Moved {Path.GetFileName(source)} -> {dest}");
+            }
+            catch (Exception ex)
+            {
+                Log($"Lỗi di chuyển file {source} -> {dest}: {ex.Message}");
+                // nếu move thất bại, copy as fallback
+                try
+                {
+                    File.Copy(source, dest);
+                    File.Delete(source);
+                    Log($"Copied (fallback) {Path.GetFileName(source)} -> {dest}");
+                }
+                catch (Exception ex2)
+                {
+                    Log($"Fallback copy failed: {ex2.Message}");
+                }
+            }
+        }
+        #endregion
+
+        #region LOGGING
+        private void Log(string message)
+        {
+            var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} - {message}";
+            try
+            {
+                this.BeginInvoke(new Action(() =>
+                {
+                    lstLog.Items.Add(line);
+                    lstLog.TopIndex = lstLog.Items.Count - 1;
+                }));
+            }
+            catch
+            {
+                // ignore if UI disposed
+            }
+        }
+        #endregion
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            base.OnFormClosing(e);
+            try
+            {
+                BtnDisconnectScan_Click(null, null);
+                BtnDisconnectPlc_Click(null, null);
+            }
+            catch { }
+        }
+    }
+}
+
+
+---
+
+3) Giải thích & nơi cần chỉnh (bắt buộc đọc)
+
+PLC register mapping: mình đã chọn dùng holding register:
+
+Config.PlcRegisterWriteAddress — nơi app viết 3 khi mã OK, viết 0 (NG) khi NG.
+
+Config.PlcCaptureFlagRegister — PLC sẽ set 1 ở register này khi 3 ảnh đã chụp xong (foot-pedal trigger -> PLC xử lý -> cameras chụp -> hệ thống chụp set flag =1). Ứng dụng poll register này thường xuyên (500ms) và xử lý khi thấy 1.
+
+Nếu PLC của bạn dùng coil boolean thay vì register thì đổi sang WriteSingleCoil hoặc thứ tương tự (tùy Modbus lib).
+
+
+Scanner COM: chỉnh Config.ScannerComPort/baud nếu khác. Cino A680 thường mặc định COM emulation, thường gởi chuỗi + newline. Mã trên đọc ReadExisting() và dùng .Trim().
+
+Temp image folder: Config.TempCaptureFolder là nơi hệ thống camera lưu 3 ảnh tạm. Ứng dụng sẽ lấy 3 file mới nhất. Nếu camera có tên file cố định theo vị trí (Top/Left/Right), bạn nên thay phần mapping selected[0..2] theo quy tắc tên.
+
+Validation QR: Regex mặc định là ^2025IT[\w-]*\+\d{2}\+\d{2}$ — nghĩa:
+
+Bắt đầu 2025IT
+
+Sau đó ký tự chữ/số/underscore/hyphen tùy (nếu format serial khác thì chỉnh)
+
+Cuối cùng có +NN+NN (mỗi NN là 2 chữ số) làm version.
+
+Ví dụ 2025IT12+07+14 sẽ match.
+
+Nếu format khác, chỉnh Config.QrRegexPattern.
+
+
+Trùng mã: code kiểm tra xem đã có ảnh Top (MatTren) tồn tại cho cùng SN trong ngày hay chưa; nếu có, sẽ báo trùng và gọi PLC NG. Bạn có thể chỉnh để ghi thêm suffix _1, _2 thay vì coi là lỗi.
+
+Ghi txt: scanned_codes.txt được append mỗi lần mã được scan (có timestamp).
+
+Xử lý lỗi: mọi IO/PLC/COM đều bọc try/catch và log rõ lỗi vào lstLog (có timestamp).
+
+UI: gồm S/N textbox, Total textbox, nút connect/disconnect scan & PLC, Image Folder mở imgAOI, status label cho PLC/COM, log list (giống "log with time"), nút clear log.
+
+
+
+---
+
+4) Nếu hệ thống của bạn khác (tình huống phổ biến) — mình gợi ý cách tùy chỉnh nhanh
+
+Nếu PLC viết ảnh trực tiếp vào folder đúng chỗ (vd: PLC/camera đặt tên chính xác), bạn chỉ cần khi nhận flag từ PLC: đổi tên (rename) file(s) đã có theo SN, không cần move từ temp.
+
+Nếu scanner gửi mã nhanh và bạn cần debounce: hiện code mình xử lý ngay, nhưng bạn có thể thêm timestamp checking (ví dụ yêu cầu 1s giữa 2 scan).
+
+Nếu camera/PLC chỉ gửi một file zip chứa 3 ảnh: thêm giải nén trước khi move.
+
+Nếu muốn map ảnh theo metadata thay vì order: thay selected mapping bằng tìm file tên chứa Top/Left/Right.
+
+
+
+---
+
+5) Lời khuyên vận hành / debug
+
+Trước khi chạy, tạo thủ công C:\AOI_Temp và copy 3 file ảnh để test chức năng di chuyển.
+
+Chỉnh Config.PlcIp và Config.ScannerComPort.
+
+Nếu kết nối PLC lỗi: kiểm tra firewall/port/địa chỉ IP.
+
+Nếu scanner không trả dữ liệu: test bằng PuTTY/teraterm vào COM để thấy chuỗi scanner gửi.
+
+Khi ready, scan một QR hợp lệ -> app gửi register=3 cho PLC -> PLC/line biết OK. Khi công nhân nhấn foot pedal, PLC trigger chụp -> sau khi chụp set flag=1 -> app poll thấy flag -> app lấy 3 ảnh tạm, rename/move và cập nhật total.
+
+
+
+---
+
+Nếu bạn muốn, mình tiếp tục làm giúp:
+
+phiên bản dùng NModbus4 nếu bạn thích,
+
+hoặc sửa phần mapping ảnh theo tên camera (ví dụ camera số 1 -> *_T.jpg, camera2 -> *_L.jpg, v.v.),
+
+hoặc tạo bản .exe kèm config file JSON để dễ cấu hình.
+
+
+Bạn muốn mình chuyển sang phiên bản dùng NModbus hay để nguyên EasyModbus? Hoặc muốn mình chỉnh regex nếu format QR khác?
+
