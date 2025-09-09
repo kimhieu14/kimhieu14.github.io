@@ -1,0 +1,87 @@
+Hiếu đang muốn dùng NModbus (còn gọi là NModbus4 – bản .NET) đúng không? 🚀
+Mình tóm tắt cho Hiếu nhé:
+
+
+---
+
+1. NModbus là gì?
+
+Là một thư viện .NET (C#) dùng để giao tiếp với thiết bị qua Modbus TCP/RTU/ASCII.
+
+Dùng nhiều trong SCADA, PLC, HMI, WinForm/WPF.
+
+Open source, khá dễ tích hợp vào dự án C#.
+
+
+
+---
+
+2. Cài đặt
+
+Cách nhanh nhất là cài bằng NuGet trong Visual Studio:
+
+Install-Package NModbus4
+
+
+---
+
+3. Code mẫu – Modbus TCP (client đọc PLC)
+
+Ví dụ đọc 10 thanh ghi Holding Register từ địa chỉ 0:
+
+using System;
+using System.Net.Sockets;
+using NModbus;
+
+class Program
+{
+    static void Main(string[] args)
+    {
+        string ip = "192.168.0.100"; // IP PLC
+        int port = 502;             // Port chuẩn Modbus TCP
+
+        using (TcpClient client = new TcpClient(ip, port))
+        {
+            var factory = new ModbusFactory();
+            var master = factory.CreateMaster(client);
+
+            // Đọc 10 thanh ghi Holding Register từ Slave ID = 1, bắt đầu tại địa chỉ 0
+            ushort startAddress = 0;
+            ushort numRegisters = 10;
+            ushort[] registers = master.ReadHoldingRegisters(1, startAddress, numRegisters);
+
+            Console.WriteLine("Kết quả đọc:");
+            for (int i = 0; i < registers.Length; i++)
+            {
+                Console.WriteLine($"Register {startAddress + i}: {registers[i]}");
+            }
+        }
+    }
+}
+
+
+---
+
+4. Ghi dữ liệu vào PLC
+
+Ví dụ ghi 123 vào thanh ghi 0:
+
+master.WriteSingleRegister(1, 0, 123);
+
+
+---
+
+5. Nếu Hiếu muốn dùng với WinForms
+
+Có thể đặt Timer để đọc dữ liệu liên tục từ PLC.
+
+Dữ liệu đọc về thì hiển thị lên TextBox, Label, hoặc DataGridView.
+
+Có thể kết hợp với đọc QR code, lưu file .txt như Hiếu vừa nói hôm qua.
+
+
+
+---
+
+👉 Hiếu muốn mình viết một project mẫu hoàn chỉnh (WinForms + NModbus + đọc/ghi PLC + lưu file txt) luôn, hay chỉ cần mình tách riêng phần code đọc/ghi bằng NModbus thôi?
+
